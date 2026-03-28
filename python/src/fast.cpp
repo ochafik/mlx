@@ -349,9 +349,10 @@ void init_fast(nb::module_& parent_module) {
       "scale"_a,
       "bits"_a = 4,
       "sparse_v_threshold"_a = 0.0f,
+      "sparse_v_mode"_a = 0,
       "stream"_a = nb::none(),
       nb::sig(
-          "def lut_scaled_dot_product_attention(q: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids_k: array, centroids_v: array, *, scale: float, bits: int = 4, sparse_v_threshold: float = 0.0, stream: Union[None, Stream, Device] = None) -> array"),
+          "def lut_scaled_dot_product_attention(q: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids_k: array, centroids_v: array, *, scale: float, bits: int = 4, sparse_v_threshold: float = 0.0, sparse_v_mode: int = 0, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         A fast implementation of multi-head attention using centroid LUT
         dequantization (TurboQuant/PolarQuant style).
@@ -381,6 +382,10 @@ void init_fast(nb::module_& parent_module) {
             bits (int): Number of bits per index (3, 4, or 8).
             sparse_v_threshold (float): Attention weight threshold below which
                 V accumulation is skipped. Use 0.0 to disable.
+            sparse_v_mode (int): Sparse-V strategy:
+                0 = dense (no sparse-V, threshold ignored),
+                1 = branch-based (skip V load per position),
+                2 = compact-then-compute (batch K-scores, compact, dense V).
         Returns:
             array: The output array.
       )pbdoc");

@@ -86,4 +86,24 @@ instantiate_lut_sdpa_vector_heads(float)
 instantiate_lut_sdpa_vector_heads(bfloat16_t)
 instantiate_lut_sdpa_vector_heads(float16_t)
 
+// Compact-then-compute LUT SDPA vector instantiations (Phase 3)
+#define instantiate_lut_sdpa_compact_v(type, head_dim, bits) \
+  instantiate_kernel(                                         \
+    "lut_sdpa_compact_v_2pass_1_" #type "_" #head_dim "_" #bits, \
+    lut_sdpa_compact_v_2pass_1, type, head_dim, bits)
+
+#define instantiate_lut_sdpa_compact_v_bits(type, head_dim) \
+  instantiate_lut_sdpa_compact_v(type, head_dim, 3)          \
+  instantiate_lut_sdpa_compact_v(type, head_dim, 4)          \
+  instantiate_lut_sdpa_compact_v(type, head_dim, 8)
+
+#define instantiate_lut_sdpa_compact_v_heads(type) \
+  instantiate_lut_sdpa_compact_v_bits(type, 64)     \
+  instantiate_lut_sdpa_compact_v_bits(type, 128)    \
+  instantiate_lut_sdpa_compact_v_bits(type, 256)
+
+instantiate_lut_sdpa_compact_v_heads(float)
+instantiate_lut_sdpa_compact_v_heads(bfloat16_t)
+instantiate_lut_sdpa_compact_v_heads(float16_t)
+
     // clang-format on

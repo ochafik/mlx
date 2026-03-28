@@ -832,3 +832,232 @@ template <typename T, int D, int bits>
     out[i] = o[i];
   }
 }
+
+// ============================================================================
+// Phase 3: Compact-then-compute LUT SDPA kernel
+//
+// Separates K-score computation from V accumulation within a single kernel
+// using batched stream compaction. Positions are processed in chunks:
+//   1. Compute K-scores for a chunk of COMPACT_CHUNK positions
+//   2. Find chunk_max, compute exp_scores, identify active positions
+//   3. Only load and accumulate V for active positions (dense, no divergence)
+//
+// Key insight: Online softmax can be decomposed per-chunk. For a chunk of
+// scores, we find chunk_max = max(scores), then:
+//   new_global_max = max(old_max, chunk_max)
+//   o *= exp(old_max - new_global_max)          // rescale existing output
+//   For each active pos: o += exp(score - new_global_max) * v
+//   sum_exp *= exp(old_max - new_global_max) + sum(exp(scores - new_global_max))
+//
+// This is mathematically equivalent to per-position online softmax because
+// the max subtraction is purely for numerical stability.
+//
+// Same thread layout as lut_sdpa_vector_2pass_1: 1 simdgroup of 32 threads,
+// each thread handles D/32 elements, nblocks=32 parallel blocks.
+// ============================================================================
+
+constant constexpr int COMPACT_CHUNK = 256;
+
+template <typename T, int D, int bits>
+[[kernel]] void lut_sdpa_compact_v_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device uint32_t* keys [[buffer(1)]],
+    const device T* k_norms [[buffer(2)]],
+    const device uint32_t* values [[buffer(3)]],
+    const device T* v_norms [[buffer(4)]],
+    const device T* centroids_k_in [[buffer(5)]],
+    const device T* centroids_v_in [[buffer(6)]],
+    device float* out [[buffer(7)]],
+    device float* sums [[buffer(8)]],
+    device float* maxs [[buffer(9)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& sparse_v_threshold,
+    const constant int& n_centroids,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+  constexpr int nblocks = 32;
+  constexpr int pack_factor = 32 / bits;
+  constexpr int max_centroids = (1 << bits);
+  constexpr int packed_per_pos = D / pack_factor;
+
+  typedef float U;
+
+  thread U q[elem_per_thread];
+  thread U k[elem_per_thread];
+  thread U o[elem_per_thread] = {0};
+
+  // Threadgroup memory:
+  //   centroids: 2 * max_centroids floats (K and V LUTs)
+  //   scores: COMPACT_CHUNK floats (raw K-scores for current chunk)
+  //   active_indices: COMPACT_CHUNK ints (compacted position indices)
+  //   shared scalars: chunk_sum, active_count
+  threadgroup U tg_centroids_k[max_centroids];
+  threadgroup U tg_centroids_v[max_centroids];
+  threadgroup U tg_scores[COMPACT_CHUNK];
+  threadgroup int tg_active_indices[COMPACT_CHUNK];
+  threadgroup U tg_chunk_sum[1];
+  threadgroup int tg_active_count[1];
+
+  // Load centroids into threadgroup memory
+  for (int c = simd_lid; c < max_centroids; c += BD) {
+    tg_centroids_k[c] = (c < n_centroids) ?
+        static_cast<U>(centroids_k_in[c]) : U(0);
+    tg_centroids_v[c] = (c < n_centroids) ?
+        static_cast<U>(centroids_v_in[c]) : U(0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Adjust positions
+  const int block_idx = tid.z;
+  const int head_idx = tid.y;
+  const int kv_head_idx = head_idx / gqa_factor;
+  queries += head_idx * D + simd_lid * elem_per_thread;
+
+  const device uint32_t* keys_base = keys + kv_head_idx * k_stride;
+  const device uint32_t* values_base = values + kv_head_idx * v_stride;
+  const int elem_offset = simd_lid * elem_per_thread;
+  const device T* k_norms_base = k_norms + kv_head_idx * N;
+  const device T* v_norms_base = v_norms + kv_head_idx * N;
+
+  out += head_idx * nblocks * D + block_idx * D + simd_lid * elem_per_thread;
+  sums += head_idx * nblocks + block_idx;
+  maxs += head_idx * nblocks + block_idx;
+
+  // Read the query
+  for (int i = 0; i < elem_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+
+  U max_score = -1e9;
+  U sum_exp_score = 0;
+
+  // Compute total positions this block processes
+  int my_pos_count = (N - block_idx + nblocks - 1) / nblocks;
+  if (block_idx >= N) my_pos_count = 0;
+
+  // Global position indices for this block: block_idx, block_idx+nblocks,
+  // block_idx+2*nblocks, ...
+  // For chunk c within a batch, global_pos = block_idx + (pos_processed + c) * nblocks
+
+  int pos_processed = 0;
+
+  while (pos_processed < my_pos_count) {
+    int chunk_size = min(COMPACT_CHUNK, my_pos_count - pos_processed);
+
+    // ================================================================
+    // Phase A: Compute K-scores for all positions in this chunk
+    // ================================================================
+    // All 32 threads cooperate on each position (simd_sum for dot product)
+    for (int c = 0; c < chunk_size; c++) {
+      int global_pos_idx = block_idx + (pos_processed + c) * nblocks;
+      const device uint32_t* keys_pos =
+          keys_base + global_pos_idx * packed_per_pos;
+
+      lut_load_at<U, elem_per_thread, bits>(
+          keys_pos, elem_offset, k, tg_centroids_k);
+
+      U score = 0;
+      for (int j = 0; j < elem_per_thread; j++) {
+        score += q[j] * k[j];
+      }
+
+      U kn = static_cast<U>(k_norms_base[global_pos_idx]);
+      score = simd_sum(score) * kn;
+
+      // Thread 0 stores the score
+      if (simd_lid == 0) {
+        tg_scores[c] = score;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ================================================================
+    // Phase B: Chunk-level softmax + compaction
+    // ================================================================
+
+    // Step 1: Find chunk_max using all 32 threads (parallel reduction)
+    U chunk_max = -1e9;
+    for (int c = simd_lid; c < chunk_size; c += BD) {
+      chunk_max = max(chunk_max, tg_scores[c]);
+    }
+    chunk_max = simd_max(chunk_max);
+
+    // Step 2: New global max and rescale factor
+    U new_global_max = max(max_score, chunk_max);
+    U global_rescale = fast::exp(max_score - new_global_max);
+
+    // Step 3: Rescale existing output accumulator
+    for (int j = 0; j < elem_per_thread; j++) {
+      o[j] *= global_rescale;
+    }
+    sum_exp_score *= global_rescale;
+
+    // Step 4: Compute exp_scores, identify active positions, compute chunk_sum
+    // Thread 0 does the serial compaction (fast: just exp + compare on scalars)
+    if (simd_lid == 0) {
+      int active = 0;
+      U chunk_sum = 0;
+      for (int c = 0; c < chunk_size; c++) {
+        U exp_s = fast::exp(tg_scores[c] - new_global_max);
+        tg_scores[c] = exp_s;  // overwrite with exp_score for V pass
+        chunk_sum += exp_s;
+
+        // Position is active if its weight exceeds threshold * running_sum
+        bool is_active = (sparse_v_threshold <= 0.0f) ||
+                         (exp_s > sparse_v_threshold * (sum_exp_score + chunk_sum));
+        if (is_active) {
+          tg_active_indices[active] = c;
+          active++;
+        }
+      }
+      tg_chunk_sum[0] = chunk_sum;
+      tg_active_count[0] = active;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 5: All threads read compaction results
+    int active_count = tg_active_count[0];
+    U chunk_sum = tg_chunk_sum[0];
+    sum_exp_score += chunk_sum;
+    max_score = new_global_max;
+
+    // ================================================================
+    // Phase C: Dense V accumulation for active positions only
+    // ================================================================
+    for (int a = 0; a < active_count; a++) {
+      int c = tg_active_indices[a];
+      int global_pos_idx = block_idx + (pos_processed + c) * nblocks;
+
+      const device uint32_t* values_pos =
+          values_base + global_pos_idx * packed_per_pos;
+      U vn = static_cast<U>(v_norms_base[global_pos_idx]);
+      U exp_s = tg_scores[c];
+
+      thread U v[elem_per_thread];
+      lut_load_at<U, elem_per_thread, bits>(
+          values_pos, elem_offset, v, tg_centroids_v);
+
+      for (int j = 0; j < elem_per_thread; j++) {
+        o[j] += exp_s * v[j] * vn;
+      }
+    }
+
+    pos_processed += chunk_size;
+  }
+
+  // Write the sum and max
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+
+  for (int i = 0; i < elem_per_thread; i++) {
+    out[i] = o[i];
+  }
+}

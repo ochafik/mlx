@@ -88,6 +88,7 @@ MLX_API array lut_scaled_dot_product_attention(
     const float scale,
     const int bits = 4,
     const float sparse_v_threshold = 0.0f,
+    const int sparse_v_mode = 0,
     StreamOrDevice s = {});
 
 using TemplateArg = std::variant<int, bool, Dtype>;

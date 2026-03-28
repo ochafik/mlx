@@ -711,16 +711,29 @@ void lut_sdpa_vector_2pass(
     array& out,
     float scale,
     float sparse_v_threshold,
-    int bits) {
-  // Set the kernel name
+    int bits,
+    int sparse_v_mode) {
+  // Set the kernel name based on sparse_v_mode
+  // Mode 0: dense (no sparse-V optimization)
+  // Mode 1: branch-based sparse-V (current lut_sdpa_vector_2pass_1)
+  // Mode 2: compact-then-compute (lut_sdpa_compact_v_2pass_1)
   std::string kname;
   kname.reserve(96);
-  kname += "lut_sdpa_vector_2pass_1_";
+  if (sparse_v_mode == 2) {
+    kname += "lut_sdpa_compact_v_2pass_1_";
+  } else {
+    kname += "lut_sdpa_vector_2pass_1_";
+  }
   kname += get_type_string(q.dtype());
   kname += "_";
   kname += std::to_string(q.shape(-1));
   kname += "_";
   kname += std::to_string(bits);
+
+  // For mode 0 (dense), set threshold to 0 to disable sparse-V
+  if (sparse_v_mode == 0) {
+    sparse_v_threshold = 0.0f;
+  }
 
   // Compute the necessary sizes
   int gqa_factor = q.shape(1) / k.shape(1);
@@ -1166,7 +1179,7 @@ void LUTScaledDotProductAttention::eval_gpu(
 
   lut_sdpa_vector_2pass(
       s, d, q, k, k_norms, v, v_norms, centroids_k, centroids_v,
-      o, scale_, sparse_v_threshold_, bits_);
+      o, scale_, sparse_v_threshold_, bits_, sparse_v_mode_);
 
   d.add_temporaries(std::move(copies), s.index);
 }

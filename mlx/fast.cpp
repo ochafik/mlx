@@ -1074,6 +1074,7 @@ array lut_scaled_dot_product_attention(
     const float scale,
     const int bits,
     const float sparse_v_threshold,
+    const int sparse_v_mode,
     StreamOrDevice s) {
   int el_per_int = 32 / bits;
 
@@ -1229,7 +1230,8 @@ array lut_scaled_dot_product_attention(
             fallback,
             scale,
             bits,
-            sparse_v_threshold),
+            sparse_v_threshold,
+            sparse_v_mode),
         {queries,
          keys_packed,
          k_norms,

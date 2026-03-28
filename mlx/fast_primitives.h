@@ -350,11 +350,13 @@ class LUTScaledDotProductAttention : public Custom {
       std::function<std::vector<array>(std::vector<array>)> fallback,
       float scale,
       int bits,
-      float sparse_v_threshold)
+      float sparse_v_threshold,
+      int sparse_v_mode)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         bits_(bits),
-        sparse_v_threshold_(sparse_v_threshold) {}
+        sparse_v_threshold_(sparse_v_threshold),
+        sparse_v_mode_(sparse_v_mode) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -368,19 +370,22 @@ class LUTScaledDotProductAttention : public Custom {
     const auto& a_other =
         static_cast<const LUTScaledDotProductAttention&>(other);
     return scale_ == a_other.scale_ && bits_ == a_other.bits_ &&
-        sparse_v_threshold_ == a_other.sparse_v_threshold_;
+        sparse_v_threshold_ == a_other.sparse_v_threshold_ &&
+        sparse_v_mode_ == a_other.sparse_v_mode_;
   }
 
   DEFINE_NAME(LUTScaledDotProductAttention);
   DEFINE_INPUT_OUTPUT_SHAPE()
   auto state() const {
-    return std::make_tuple(nullptr, scale_, bits_, sparse_v_threshold_);
+    return std::make_tuple(
+        nullptr, scale_, bits_, sparse_v_threshold_, sparse_v_mode_);
   }
 
  private:
   float scale_;
   int bits_;
   float sparse_v_threshold_;
+  int sparse_v_mode_;
 };
 
 class ConvertFP8 : public Primitive {
