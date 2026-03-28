@@ -295,6 +295,94 @@ class ScaledDotProductAttentionVJP : public Custom {
   bool has_sinks_;
 };
 
+// ============================================================================
+// Affine quantized SDPA (ported from q-sdpa branch)
+// ============================================================================
+
+class QuantizedScaledDotProductAttention : public Custom {
+ public:
+  QuantizedScaledDotProductAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      int group_size,
+      int bits)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    outputs = fallback_(inputs);
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& a_other =
+        static_cast<const QuantizedScaledDotProductAttention&>(other);
+    return scale_ == a_other.scale_ && group_size_ == a_other.group_size_ &&
+        bits_ == a_other.bits_;
+  }
+
+  DEFINE_NAME(QuantizedScaledDotProductAttention);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, scale_, group_size_, bits_);
+  }
+
+ private:
+  float scale_;
+  int group_size_;
+  int bits_;
+};
+
+// ============================================================================
+// Centroid LUT SDPA (TurboQuant/PolarQuant style)
+// ============================================================================
+
+class LUTScaledDotProductAttention : public Custom {
+ public:
+  LUTScaledDotProductAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      int bits,
+      float sparse_v_threshold)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        bits_(bits),
+        sparse_v_threshold_(sparse_v_threshold) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    outputs = fallback_(inputs);
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& a_other =
+        static_cast<const LUTScaledDotProductAttention&>(other);
+    return scale_ == a_other.scale_ && bits_ == a_other.bits_ &&
+        sparse_v_threshold_ == a_other.sparse_v_threshold_;
+  }
+
+  DEFINE_NAME(LUTScaledDotProductAttention);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, scale_, bits_, sparse_v_threshold_);
+  }
+
+ private:
+  float scale_;
+  int bits_;
+  float sparse_v_threshold_;
+};
+
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)

@@ -41,4 +41,47 @@ using namespace metal;
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+// Affine quantized SDPA vector instantiations
+#define instantiate_quant_sdpa_vector(type, head_dim, group_size, bits) \
+  instantiate_kernel(                                                   \
+    "quant_sdpa_vector_2pass_1_" #type "_" #head_dim "_" #group_size "_" #bits, \
+    quant_sdpa_vector_2pass_1, type, head_dim, group_size, bits)
+
+#define instantiate_quant_sdpa_vector_bits(type, heads, group_size) \
+  instantiate_quant_sdpa_vector(type, heads, group_size, 4)         \
+  instantiate_quant_sdpa_vector(type, heads, group_size, 8)
+
+#define instantiate_quant_sdpa_vector_group_size(type, heads) \
+  instantiate_quant_sdpa_vector_bits(type, heads, 32)         \
+  instantiate_quant_sdpa_vector_bits(type, heads, 64)         \
+  instantiate_quant_sdpa_vector_bits(type, heads, 128)
+
+#define instantiate_quant_sdpa_vector_heads(type) \
+  instantiate_quant_sdpa_vector_group_size(type, 64)  \
+  instantiate_quant_sdpa_vector_group_size(type, 128)
+
+instantiate_quant_sdpa_vector_heads(float)
+instantiate_quant_sdpa_vector_heads(bfloat16_t)
+instantiate_quant_sdpa_vector_heads(float16_t)
+
+// Centroid LUT SDPA vector instantiations
+#define instantiate_lut_sdpa_vector(type, head_dim, bits) \
+  instantiate_kernel(                                      \
+    "lut_sdpa_vector_2pass_1_" #type "_" #head_dim "_" #bits, \
+    lut_sdpa_vector_2pass_1, type, head_dim, bits)
+
+#define instantiate_lut_sdpa_vector_bits(type, head_dim) \
+  instantiate_lut_sdpa_vector(type, head_dim, 3)          \
+  instantiate_lut_sdpa_vector(type, head_dim, 4)          \
+  instantiate_lut_sdpa_vector(type, head_dim, 8)
+
+#define instantiate_lut_sdpa_vector_heads(type) \
+  instantiate_lut_sdpa_vector_bits(type, 64)     \
+  instantiate_lut_sdpa_vector_bits(type, 128)
+
+instantiate_lut_sdpa_vector_heads(float)
+instantiate_lut_sdpa_vector_heads(bfloat16_t)
+instantiate_lut_sdpa_vector_heads(float16_t)
+
     // clang-format on

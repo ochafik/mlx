@@ -922,6 +922,323 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_;
 }
 
+// ============================================================================
+// Affine quantized SDPA
+// ============================================================================
+
+array quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const array& key_biases,
+    const array& values,
+    const array& value_scales,
+    const array& value_biases,
+    const float scale,
+    const int group_size,
+    const int bits,
+    StreamOrDevice s) {
+  int el_per_int = 32 / bits;
+
+  for (const auto& tensor : {queries, keys, values}) {
+    if (tensor.ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[quantized_scaled_dot_product_attention] input with shape "
+          << tensor.shape() << " expected to be rank 4";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  // Q, K must have matching last dims (accounting for packing)
+  if (queries.shape(-1) != keys.shape(-1) * el_per_int) {
+    std::ostringstream msg;
+    msg << "[quantized_scaled_dot_product_attention] query, keys expected to have matching last dimension; found query shape "
+        << queries.shape() << " for keys shape " << keys.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = result_type(queries, key_scales, value_scales);
+  if (!issubdtype(final_type, floating)) {
+    std::ostringstream msg;
+    msg << "[quantized_scaled_dot_product_attention] Received unsupported type "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int out_dim = values.shape(-1) * el_per_int;
+  auto n_q_heads = queries.shape(-3);
+  auto n_kv_heads = keys.shape(-3);
+
+  auto out_shape = Shape(
+      {queries.shape(0), queries.shape(1), queries.shape(2), out_dim});
+  auto stream = to_stream(s);
+
+  auto fallback =
+      [scale, n_q_heads, n_kv_heads, group_size, bits, &s](
+          const std::vector<array>& inputs) -> std::vector<array> {
+    int n_repeats = n_q_heads / n_kv_heads;
+
+    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+
+    auto k = inputs[1];
+    auto k_scales = inputs[2];
+    auto k_biases = inputs[3];
+    auto v = inputs[4];
+    auto v_scales = inputs[5];
+    auto v_biases = inputs[6];
+
+    int B = q.shape(0);
+    int L = q.shape(2);
+
+    if (n_repeats > 1) {
+      q = reshape(q, {B, n_kv_heads, n_repeats, L, -1}, s);
+      k = expand_dims(k, 2, s);
+      k_scales = expand_dims(k_scales, 2, s);
+      k_biases = expand_dims(k_biases, 2, s);
+      v = expand_dims(v, 2, s);
+      v_scales = expand_dims(v_scales, 2, s);
+      v_biases = expand_dims(v_biases, 2, s);
+    }
+
+    array scores = quantized_matmul(
+        q,
+        k,
+        k_scales,
+        k_biases,
+        /*transpose=*/true,
+        /*group_size=*/std::optional<int>(group_size),
+        /*bits=*/std::optional<int>(bits),
+        /*mode=*/"affine",
+        s);
+    scores = softmax(scores, std::vector<int>{-1}, true, s);
+    array out = quantized_matmul(
+        scores,
+        v,
+        v_scales,
+        v_biases,
+        /*transpose=*/false,
+        /*group_size=*/std::optional<int>(group_size),
+        /*bits=*/std::optional<int>(bits),
+        /*mode=*/"affine",
+        s);
+    if (n_repeats > 1) {
+      out = reshape(out, {B, n_q_heads, L, -1}, s);
+    }
+    return std::vector<array>{out};
+  };
+
+  int query_head_dim = queries.shape(-1);
+  int L = queries.shape(2);
+  bool compatible_head_dim = query_head_dim == 64 || query_head_dim == 128;
+  if (L > 1 || !compatible_head_dim || stream.device == Device::cpu) {
+    return fallback(
+        {queries,
+         keys,
+         key_scales,
+         key_biases,
+         values,
+         value_scales,
+         value_biases})[0];
+  } else {
+    return array(
+        std::move(out_shape),
+        queries.dtype(),
+        std::make_shared<QuantizedScaledDotProductAttention>(
+            stream,
+            fallback,
+            scale,
+            group_size,
+            bits),
+        {queries,
+         keys,
+         key_scales,
+         key_biases,
+         values,
+         value_scales,
+         value_biases});
+  }
+}
+
+// ============================================================================
+// Centroid LUT SDPA
+// ============================================================================
+
+array lut_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys_packed,
+    const array& k_norms,
+    const array& values_packed,
+    const array& v_norms,
+    const array& centroids_k,
+    const array& centroids_v,
+    const float scale,
+    const int bits,
+    const float sparse_v_threshold,
+    StreamOrDevice s) {
+  int el_per_int = 32 / bits;
+
+  if (queries.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] queries with shape "
+        << queries.shape() << " expected to be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys_packed.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] keys_packed with shape "
+        << keys_packed.shape() << " expected to be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  if (values_packed.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] values_packed with shape "
+        << values_packed.shape() << " expected to be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  if (centroids_k.ndim() != 1) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] centroids_k with shape "
+        << centroids_k.shape() << " expected to be rank 1";
+    throw std::invalid_argument(msg.str());
+  }
+  if (centroids_v.ndim() != 1) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] centroids_v with shape "
+        << centroids_v.shape() << " expected to be rank 1";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_norms.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] k_norms with shape "
+        << k_norms.shape() << " expected to be rank 3 (B, n_kv_heads, N)";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = result_type(queries, k_norms, v_norms);
+  if (!issubdtype(final_type, floating)) {
+    std::ostringstream msg;
+    msg << "[lut_scaled_dot_product_attention] Received unsupported type "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int query_head_dim = queries.shape(-1);
+  int out_dim = values_packed.shape(-1) * el_per_int;
+  auto n_q_heads = queries.shape(-3);
+  auto n_kv_heads = keys_packed.shape(-3);
+
+  auto out_shape = Shape(
+      {queries.shape(0), queries.shape(1), queries.shape(2), out_dim});
+  auto stream = to_stream(s);
+
+  // Fallback: dequantize via LUT and run standard attention
+  auto fallback =
+      [scale, n_q_heads, n_kv_heads, bits, el_per_int, out_dim, sparse_v_threshold, &s](
+          const std::vector<array>& inputs) -> std::vector<array> {
+    int n_repeats = n_q_heads / n_kv_heads;
+
+    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    auto k_packed = inputs[1];
+    auto k_norms_arr = inputs[2];
+    auto v_packed = inputs[3];
+    auto v_norms_arr = inputs[4];
+    auto centroids_k_arr = inputs[5];
+    auto centroids_v_arr = inputs[6];
+
+    int B = q.shape(0);
+    int L = q.shape(2);
+    int N = k_norms_arr.shape(2);  // sequence length
+
+    // Dequantize keys: for each packed element, look up centroid
+    // k_packed: [B, n_kv_heads, N, D/el_per_int] as uint32
+    // We need to unpack and look up centroids, then multiply by norms
+    // For the fallback, we do this element-by-element in MLX ops
+
+    // Unpack indices from packed uint32 arrays
+    int D = k_packed.shape(-1) * el_per_int;
+
+    // Unpack: extract el_per_int indices from each uint32
+    // packed: [B, H, N, packed_dim], output: [B, H, N, packed_dim * el_per_int]
+    auto unpack_indices = [&](const array& packed, int dim) -> array {
+      auto p = astype(packed, int32, s);
+      // Extract each sub-element into a new axis: [B, H, N, packed_dim, el_per_int]
+      std::vector<array> parts;
+      int epi = el_per_int;
+      for (int i = 0; i < epi; i++) {
+        auto idx = bitwise_and(
+            right_shift(p, array(i * bits, int32), s),
+            array((1 << bits) - 1, int32), s);
+        // [B, H, N, packed_dim] -> [B, H, N, packed_dim, 1]
+        parts.push_back(expand_dims(idx, -1, s));
+      }
+      // Stack along the new axis: [B, H, N, packed_dim, el_per_int]
+      auto stacked = concatenate(parts, -1, s);
+      // Reshape to [B, H, N, packed_dim * el_per_int]
+      auto shape = packed.shape();
+      shape.back() = dim;
+      return reshape(stacked, shape, s);
+    };
+
+    auto k_indices = unpack_indices(k_packed, D);
+    auto v_indices = unpack_indices(v_packed, out_dim);
+
+    // Look up centroids: centroids[indices]
+    auto k_vals = take(centroids_k_arr, k_indices, s);
+    auto v_vals = take(centroids_v_arr, v_indices, s);
+
+    // Multiply by per-position norms
+    // k_norms: [B, n_kv_heads, N] -> expand to [B, n_kv_heads, N, 1]
+    auto kn = expand_dims(k_norms_arr, -1, s);
+    auto vn = expand_dims(v_norms_arr, -1, s);
+    k_vals = multiply(k_vals, kn, s);
+    v_vals = multiply(v_vals, vn, s);
+
+    if (n_repeats > 1) {
+      q = reshape(q, {B, n_kv_heads, n_repeats, L, -1}, s);
+      k_vals = expand_dims(k_vals, 2, s);
+      v_vals = expand_dims(v_vals, 2, s);
+    }
+
+    auto scores = matmul(q, swapaxes(k_vals, -1, -2, s), s);
+    scores = softmax(scores, std::vector<int>{-1}, true, s);
+    auto out = matmul(scores, v_vals, s);
+    if (n_repeats > 1) {
+      out = reshape(out, {B, n_q_heads, L, -1}, s);
+    }
+    return std::vector<array>{out};
+  };
+
+  int L = queries.shape(2);
+  bool compatible_head_dim = query_head_dim == 64 || query_head_dim == 128;
+  if (L > 1 || !compatible_head_dim || stream.device == Device::cpu) {
+    return fallback(
+        {queries,
+         keys_packed,
+         k_norms,
+         values_packed,
+         v_norms,
+         centroids_k,
+         centroids_v})[0];
+  } else {
+    return array(
+        std::move(out_shape),
+        queries.dtype(),
+        std::make_shared<LUTScaledDotProductAttention>(
+            stream,
+            fallback,
+            scale,
+            bits,
+            sparse_v_threshold),
+        {queries,
+         keys_packed,
+         k_norms,
+         values_packed,
+         v_norms,
+         centroids_k,
+         centroids_v});
+  }
+}
+
 bool Quantize::is_equivalent(const Primitive& other) const {
   const Quantize& p_other = static_cast<const Quantize&>(other);
   return (

@@ -297,6 +297,95 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "quantized_scaled_dot_product_attention",
+      &mx::fast::quantized_scaled_dot_product_attention,
+      "q"_a,
+      "k"_a,
+      "k_scales"_a,
+      "k_biases"_a,
+      "v"_a,
+      "v_scales"_a,
+      "v_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "group_size"_a = 64,
+      "bits"_a = 4,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def quantized_scaled_dot_product_attention(q: array, k: array, k_scales: array, k_biases: array, v: array, v_scales: array, v_biases: array, *, scale: float, group_size: int = 64, bits: int = 4, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        A fast implementation of multi-head attention where the keys and values
+        are affine-quantized.
+
+        Supports the same attention variants as
+        :func:`scaled_dot_product_attention`.
+
+        Args:
+            q (array): Input query array.
+            k (array): Input quantized keys array (packed uint32).
+            k_scales (array): Scales for the quantized keys array.
+            k_biases (array): Biases for the quantized keys array.
+            v (array): Input quantized values array (packed uint32).
+            v_scales (array): Scales for the quantized values array.
+            v_biases (array): Biases for the quantized values array.
+            scale (float): Scale for queries (typically ``1.0 / sqrt(q.shape(-1))``).
+            group_size (int): The group size used in the KV quantization.
+            bits (int): The bits used in the KV quantization.
+        Returns:
+            array: The output array.
+      )pbdoc");
+
+  m.def(
+      "lut_scaled_dot_product_attention",
+      &mx::fast::lut_scaled_dot_product_attention,
+      "q"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids_k"_a,
+      "centroids_v"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "bits"_a = 4,
+      "sparse_v_threshold"_a = 0.0f,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def lut_scaled_dot_product_attention(q: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids_k: array, centroids_v: array, *, scale: float, bits: int = 4, sparse_v_threshold: float = 0.0, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        A fast implementation of multi-head attention using centroid LUT
+        dequantization (TurboQuant/PolarQuant style).
+
+        Instead of affine dequant (value = scale * packed + bias), this uses:
+          value = centroids[packed_index] * norm
+        where centroids is a small lookup table and norm is per-position.
+
+        Supports sparse-V optimization: positions with attention weight below
+        ``sparse_v_threshold`` are skipped during V accumulation.
+
+        Args:
+            q (array): Input query array of shape ``[B, n_q_heads, 1, D]``.
+            k_packed (array): Packed quantized keys of shape
+                ``[B, n_kv_heads, N, D // pack_factor]`` (uint32).
+            k_norms (array): Per-position key norms of shape
+                ``[B, n_kv_heads, N]``.
+            v_packed (array): Packed quantized values of shape
+                ``[B, n_kv_heads, N, D // pack_factor]`` (uint32).
+            v_norms (array): Per-position value norms of shape
+                ``[B, n_kv_heads, N]``.
+            centroids_k (array): Key centroid LUT of shape ``[n_centroids]``
+                (e.g. 8 for 3-bit, 16 for 4-bit).
+            centroids_v (array): Value centroid LUT of shape ``[n_centroids]``.
+            scale (float): Scale for queries
+                (typically ``1.0 / sqrt(q.shape(-1))``).
+            bits (int): Number of bits per index (3, 4, or 8).
+            sparse_v_threshold (float): Attention weight threshold below which
+                V accumulation is skipped. Use 0.0 to disable.
+        Returns:
+            array: The output array.
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

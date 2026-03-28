@@ -643,5 +643,331 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     self.assertTrue(mx.allclose(ref, out, **tolerance))
 
 
+class TestQuantizedSDPA(mlx_tests.MLXTestCase):
+    """Tests for affine quantized SDPA (ported from q-sdpa branch)."""
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "requires GPU")
+    def test_quantized_sdpa_basic(self):
+        """Test affine quantized SDPA matches dequantized reference."""
+        B, H, R, Dk = 1, 32, 1, 128
+        scale = 1.0 / math.sqrt(Dk)
+
+        for seq_len in [1, 7, 32, 129, 400]:
+            for do_gqa in [False, True]:
+                for bits in [4, 8]:
+                    with self.subTest(
+                        seq_len=seq_len, gqa=do_gqa, bits=bits
+                    ):
+                        n_kv_heads = 8 if do_gqa else 32
+                        q = mx.random.normal(shape=(B, H, R, Dk))
+                        k = mx.random.normal(
+                            shape=(B, n_kv_heads, seq_len, Dk)
+                        )
+                        v = mx.random.normal(
+                            shape=(B, n_kv_heads, seq_len, Dk)
+                        )
+
+                        # Quantize keys and values
+                        k_q, k_scales, k_biases = mx.quantize(k, bits=bits)
+                        v_q, v_scales, v_biases = mx.quantize(v, bits=bits)
+
+                        # Dequantize for reference
+                        k_d = mx.dequantize(k_q, k_scales, k_biases, bits=bits)
+                        v_d = mx.dequantize(v_q, v_scales, v_biases, bits=bits)
+
+                        # Reference: standard SDPA with dequantized KV
+                        reference = mlx_ref_attn(q, k_d, v_d, scale)
+
+                        # Quantized SDPA
+                        o_q = mx.fast.quantized_scaled_dot_product_attention(
+                            q,
+                            k_q,
+                            k_scales,
+                            k_biases,
+                            v_q,
+                            v_scales,
+                            v_biases,
+                            scale=scale,
+                            bits=bits,
+                        )
+
+                        self.assertListEqual(
+                            list(reference.shape), list(o_q.shape)
+                        )
+                        rtol = 1e-2 if seq_len > 500 else 1e-5
+                        self.assertTrue(
+                            mx.allclose(
+                                o_q, reference, rtol=rtol, atol=1e-1
+                            )
+                        )
+
+
+class TestLUTSDPA(mlx_tests.MLXTestCase):
+    """Tests for centroid LUT SDPA (TurboQuant/PolarQuant style)."""
+
+    def _make_lut_inputs(self, B, n_kv_heads, seq_len, D, bits, dtype=mx.float32):
+        """Create LUT-quantized inputs for testing.
+
+        Simulates centroid LUT quantization:
+        1. Generate random K/V
+        2. Compute centroids via simple quantile binning
+        3. Quantize each element to nearest centroid index
+        4. Pack indices into uint32
+        5. Compute per-position norms
+        """
+        n_centroids = 1 << bits
+        el_per_int = 32 // bits
+
+        # Generate random K and V
+        k_fp = mx.random.normal(shape=(B, n_kv_heads, seq_len, D))
+        v_fp = mx.random.normal(shape=(B, n_kv_heads, seq_len, D))
+
+        # Create centroids: evenly spaced in the data range
+        # Use fixed centroids for simplicity
+        centroids_k = mx.array(
+            [float(i - n_centroids // 2) / (n_centroids // 2)
+             for i in range(n_centroids)],
+            dtype=dtype,
+        )
+        centroids_v = mx.array(
+            [float(i - n_centroids // 2) / (n_centroids // 2)
+             for i in range(n_centroids)],
+            dtype=dtype,
+        )
+
+        # Compute per-position norms
+        k_norms = mx.sqrt(mx.sum(mx.square(k_fp), axis=-1))
+        v_norms = mx.sqrt(mx.sum(mx.square(v_fp), axis=-1))
+        # Avoid division by zero
+        k_norms = mx.where(k_norms > 1e-8, k_norms, mx.ones_like(k_norms))
+        v_norms = mx.where(v_norms > 1e-8, v_norms, mx.ones_like(v_norms))
+
+        # Normalize K and V
+        k_normalized = k_fp / mx.expand_dims(k_norms, -1)
+        v_normalized = v_fp / mx.expand_dims(v_norms, -1)
+
+        # Quantize each element to nearest centroid
+        def quantize_to_centroids(data, centroids):
+            # data: [..., D], centroids: [n_centroids]
+            # Find nearest centroid for each element
+            # Expand for broadcasting: data [..., D, 1], centroids [1, n_centroids]
+            diffs = mx.abs(
+                mx.expand_dims(data, -1) - mx.reshape(centroids, (1, -1))
+            )
+            indices = mx.argmin(diffs, axis=-1)
+            return indices  # [..., D]
+
+        k_indices = quantize_to_centroids(k_normalized, centroids_k)
+        v_indices = quantize_to_centroids(v_normalized, centroids_v)
+
+        # Pack indices into uint32
+        def pack_indices(indices, bits):
+            # indices: [..., D] with values in [0, 2^bits)
+            el_per_int = 32 // bits
+            shape = list(indices.shape)
+            D = shape[-1]
+            packed_dim = (D + el_per_int - 1) // el_per_int
+            # Pad D to multiple of el_per_int
+            if D % el_per_int != 0:
+                pad_size = el_per_int - (D % el_per_int)
+                pad_shape = shape[:-1] + [pad_size]
+                indices = mx.concatenate(
+                    [indices, mx.zeros(pad_shape, dtype=indices.dtype)], axis=-1
+                )
+                D = D + pad_size
+
+            indices = mx.reshape(indices, shape[:-1] + [packed_dim, el_per_int])
+            indices = indices.astype(mx.uint32)
+
+            # Pack: shift each index by its position and OR together
+            packed = mx.zeros(shape[:-1] + [packed_dim], dtype=mx.uint32)
+            for i in range(el_per_int):
+                shifted = mx.left_shift(indices[..., i], mx.array(i * bits, mx.uint32))
+                packed = mx.bitwise_or(packed, shifted)
+            return packed
+
+        k_packed = pack_indices(k_indices, bits)
+        v_packed = pack_indices(v_indices, bits)
+
+        # Reconstruct dequantized values for reference
+        k_dequant = mx.take(centroids_k, k_indices, axis=0)
+        v_dequant = mx.take(centroids_v, v_indices, axis=0)
+        k_dequant = k_dequant * mx.expand_dims(k_norms, -1)
+        v_dequant = v_dequant * mx.expand_dims(v_norms, -1)
+
+        return (
+            k_packed,
+            k_norms,
+            v_packed,
+            v_norms,
+            centroids_k,
+            centroids_v,
+            k_dequant,
+            v_dequant,
+        )
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "requires GPU")
+    def test_lut_sdpa_vs_reference(self):
+        """Test LUT SDPA matches dequantized reference SDPA."""
+        B, n_q_heads, R, D = 1, 32, 1, 128
+        scale = 1.0 / math.sqrt(D)
+
+        for seq_len in [1, 7, 32, 129]:
+            for do_gqa in [False, True]:
+                for bits in [4]:
+                    with self.subTest(
+                        seq_len=seq_len, gqa=do_gqa, bits=bits
+                    ):
+                        n_kv_heads = 8 if do_gqa else 32
+                        q = mx.random.normal(
+                            shape=(B, n_q_heads, R, D)
+                        )
+
+                        (
+                            k_packed,
+                            k_norms,
+                            v_packed,
+                            v_norms,
+                            centroids_k,
+                            centroids_v,
+                            k_dequant,
+                            v_dequant,
+                        ) = self._make_lut_inputs(
+                            B, n_kv_heads, seq_len, D, bits
+                        )
+
+                        # Reference: standard SDPA with dequantized KV
+                        reference = mlx_ref_attn(
+                            q, k_dequant, v_dequant, scale
+                        )
+
+                        # LUT SDPA
+                        o_lut = mx.fast.lut_scaled_dot_product_attention(
+                            q,
+                            k_packed,
+                            k_norms,
+                            v_packed,
+                            v_norms,
+                            centroids_k,
+                            centroids_v,
+                            scale=scale,
+                            bits=bits,
+                            sparse_v_threshold=0.0,
+                        )
+
+                        self.assertListEqual(
+                            list(reference.shape), list(o_lut.shape)
+                        )
+                        self.assertTrue(
+                            mx.allclose(
+                                o_lut, reference, rtol=1e-2, atol=1e-1
+                            ),
+                            f"LUT SDPA mismatch at seq_len={seq_len}, gqa={do_gqa}, bits={bits}. "
+                            f"max_diff={mx.max(mx.abs(o_lut - reference)).item():.6f}",
+                        )
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "requires GPU")
+    def test_sparse_v_threshold_zero_matches_dense(self):
+        """Test that sparse_v_threshold=0 gives same results as no sparsity."""
+        B, n_q_heads, R, D = 1, 32, 1, 128
+        scale = 1.0 / math.sqrt(D)
+        seq_len = 64
+        n_kv_heads = 8
+        bits = 4
+
+        q = mx.random.normal(shape=(B, n_q_heads, R, D))
+        (
+            k_packed,
+            k_norms,
+            v_packed,
+            v_norms,
+            centroids_k,
+            centroids_v,
+            _,
+            _,
+        ) = self._make_lut_inputs(B, n_kv_heads, seq_len, D, bits)
+
+        # With threshold=0 (no sparsity)
+        o_dense = mx.fast.lut_scaled_dot_product_attention(
+            q,
+            k_packed,
+            k_norms,
+            v_packed,
+            v_norms,
+            centroids_k,
+            centroids_v,
+            scale=scale,
+            bits=bits,
+            sparse_v_threshold=0.0,
+        )
+
+        # With very small threshold (should still include almost everything)
+        o_sparse = mx.fast.lut_scaled_dot_product_attention(
+            q,
+            k_packed,
+            k_norms,
+            v_packed,
+            v_norms,
+            centroids_k,
+            centroids_v,
+            scale=scale,
+            bits=bits,
+            sparse_v_threshold=1e-10,
+        )
+
+        self.assertTrue(
+            mx.allclose(o_dense, o_sparse, rtol=1e-5, atol=1e-5),
+            f"sparse_v_threshold=0 vs 1e-10 mismatch. "
+            f"max_diff={mx.max(mx.abs(o_dense - o_sparse)).item():.6f}",
+        )
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "requires GPU")
+    def test_lut_sdpa_different_bits(self):
+        """Test LUT SDPA with different bit widths."""
+        B, n_q_heads, R, D = 1, 32, 1, 128
+        scale = 1.0 / math.sqrt(D)
+        seq_len = 32
+        n_kv_heads = 8
+
+        for bits in [4]:
+            with self.subTest(bits=bits):
+                q = mx.random.normal(shape=(B, n_q_heads, R, D))
+                (
+                    k_packed,
+                    k_norms,
+                    v_packed,
+                    v_norms,
+                    centroids_k,
+                    centroids_v,
+                    k_dequant,
+                    v_dequant,
+                ) = self._make_lut_inputs(
+                    B, n_kv_heads, seq_len, D, bits
+                )
+
+                reference = mlx_ref_attn(q, k_dequant, v_dequant, scale)
+
+                o_lut = mx.fast.lut_scaled_dot_product_attention(
+                    q,
+                    k_packed,
+                    k_norms,
+                    v_packed,
+                    v_norms,
+                    centroids_k,
+                    centroids_v,
+                    scale=scale,
+                    bits=bits,
+                )
+
+                self.assertListEqual(
+                    list(reference.shape), list(o_lut.shape)
+                )
+                self.assertTrue(
+                    mx.allclose(o_lut, reference, rtol=1e-2, atol=1e-1),
+                    f"LUT SDPA mismatch at bits={bits}. "
+                    f"max_diff={mx.max(mx.abs(o_lut - reference)).item():.6f}",
+                )
+
+
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner(failfast=True)

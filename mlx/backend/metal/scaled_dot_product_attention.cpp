@@ -583,6 +583,225 @@ void sdpa_vector_2pass(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// ============================================================================
+// Affine quantized SDPA (ported from q-sdpa branch)
+// ============================================================================
+
+void quant_sdpa_vector_2pass(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v,
+    const array& v_scales,
+    const array& v_biases,
+    array& out,
+    float scale,
+    int group_size,
+    int bits) {
+  // Set the kernel name
+  std::string kname;
+  kname.reserve(96);
+  kname += "quant_sdpa_vector_2pass_1_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(group_size);
+  kname += "_";
+  kname += std::to_string(bits);
+
+  // Compute the necessary sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  int blocks = 32;
+  int B = q.shape(0) * q.shape(1);
+  size_t k_stride = k.strides()[1];
+  size_t v_stride = v.strides()[1];
+  size_t k_group_stride = k_scales.strides()[1];
+  size_t v_group_stride = v_scales.strides()[1];
+  MTL::Size group_dims(8 * 4, 1, 1);
+  MTL::Size grid_dims(1, B, blocks);
+
+  // Allocate the intermediates
+  Shape intermediate_shape;
+  intermediate_shape.reserve(out.ndim() + 1);
+  intermediate_shape.insert(
+      intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
+  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(out.shape().back());
+  array intermediate(intermediate_shape, float32, nullptr, {});
+  intermediate_shape.pop_back();
+  array sums(intermediate_shape, float32, nullptr, {});
+  array maxs(std::move(intermediate_shape), float32, nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  maxs.set_data(allocator::malloc(maxs.nbytes()));
+  d.add_temporary(intermediate, s.index);
+  d.add_temporary(sums, s.index);
+  d.add_temporary(maxs, s.index);
+
+  // Get the kernel
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(q.data_shared_ptr() == nullptr ? out : q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(k_scales, 2);
+  compute_encoder.set_input_array(k_biases, 3);
+  compute_encoder.set_input_array(v, 4);
+  compute_encoder.set_input_array(v_scales, 5);
+  compute_encoder.set_input_array(v_biases, 6);
+  compute_encoder.set_output_array(intermediate, 7);
+  compute_encoder.set_output_array(sums, 8);
+  compute_encoder.set_output_array(maxs, 9);
+  compute_encoder.set_bytes(gqa_factor, 10);
+  compute_encoder.set_bytes(N, 11);
+  compute_encoder.set_bytes(k_stride, 12);
+  compute_encoder.set_bytes(v_stride, 13);
+  compute_encoder.set_bytes(k_group_stride, 14);
+  compute_encoder.set_bytes(v_group_stride, 15);
+  compute_encoder.set_bytes(scale, 16);
+
+  // Launch
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // Final pass (reuse the existing 2pass_2 kernel)
+  kname.clear();
+  kname += "sdpa_vector_2pass_2_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+
+  // Get the kernel
+  kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_input_array(sums, 1);
+  compute_encoder.set_input_array(maxs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(blocks, 4);
+
+  // Launch
+  group_dims = MTL::Size(1024, 1, 1);
+  grid_dims = MTL::Size(B, 1, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// ============================================================================
+// Centroid LUT SDPA (TurboQuant/PolarQuant style)
+// ============================================================================
+
+void lut_sdpa_vector_2pass(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& k_norms,
+    const array& v,
+    const array& v_norms,
+    const array& centroids_k,
+    const array& centroids_v,
+    array& out,
+    float scale,
+    float sparse_v_threshold,
+    int bits) {
+  // Set the kernel name
+  std::string kname;
+  kname.reserve(96);
+  kname += "lut_sdpa_vector_2pass_1_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(bits);
+
+  // Compute the necessary sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k_norms.shape(2);  // sequence length from norms
+  int blocks = 32;
+  int B = q.shape(0) * q.shape(1);
+  size_t k_stride = k.strides()[1];
+  size_t v_stride = v.strides()[1];
+  int n_centroids = centroids_k.shape(0);
+  MTL::Size group_dims(8 * 4, 1, 1);
+  MTL::Size grid_dims(1, B, blocks);
+
+  // Allocate the intermediates
+  Shape intermediate_shape;
+  intermediate_shape.reserve(out.ndim() + 1);
+  intermediate_shape.insert(
+      intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
+  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(out.shape().back());
+  array intermediate(intermediate_shape, float32, nullptr, {});
+  intermediate_shape.pop_back();
+  array sums(intermediate_shape, float32, nullptr, {});
+  array maxs(std::move(intermediate_shape), float32, nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  maxs.set_data(allocator::malloc(maxs.nbytes()));
+  d.add_temporary(intermediate, s.index);
+  d.add_temporary(sums, s.index);
+  d.add_temporary(maxs, s.index);
+
+  // Get the kernel
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(q.data_shared_ptr() == nullptr ? out : q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(k_norms, 2);
+  compute_encoder.set_input_array(v, 3);
+  compute_encoder.set_input_array(v_norms, 4);
+  compute_encoder.set_input_array(centroids_k, 5);
+  compute_encoder.set_input_array(centroids_v, 6);
+  compute_encoder.set_output_array(intermediate, 7);
+  compute_encoder.set_output_array(sums, 8);
+  compute_encoder.set_output_array(maxs, 9);
+  compute_encoder.set_bytes(gqa_factor, 10);
+  compute_encoder.set_bytes(N, 11);
+  compute_encoder.set_bytes(k_stride, 12);
+  compute_encoder.set_bytes(v_stride, 13);
+  compute_encoder.set_bytes(scale, 14);
+  compute_encoder.set_bytes(sparse_v_threshold, 15);
+  compute_encoder.set_bytes(n_centroids, 16);
+
+  // Launch
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // Final pass (reuse the existing 2pass_2 kernel)
+  kname.clear();
+  kname += "sdpa_vector_2pass_2_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+
+  // Get the kernel
+  kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_input_array(sums, 1);
+  compute_encoder.set_input_array(maxs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(blocks, 4);
+
+  // Launch
+  group_dims = MTL::Size(1024, 1, 1);
+  grid_dims = MTL::Size(B, 1, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 } // namespace
 
 bool ScaledDotProductAttention::use_fallback(
@@ -793,6 +1012,150 @@ void ScaledDotProductAttentionVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   throw std::runtime_error("NYI");
+}
+
+// ============================================================================
+// QuantizedScaledDotProductAttention
+// ============================================================================
+
+void QuantizedScaledDotProductAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& q_pre = inputs[0];
+  auto& k_pre = inputs[1];
+  auto& k_scales_pre = inputs[2];
+  auto& k_biases_pre = inputs[3];
+  auto& v_pre = inputs[4];
+  auto& v_scales_pre = inputs[5];
+  auto& v_biases_pre = inputs[6];
+  auto& o = outputs[0];
+
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    } else {
+      return arr;
+    }
+  };
+
+  auto is_contiguous = [](const array& arr) {
+    return arr.flags().row_contiguous;
+  };
+
+  auto is_contiguous_except_seq_len = [](const array& arr) {
+    auto& strides = arr.strides();
+    auto& shape = arr.shape();
+    if (strides.back() != 1) {
+      return false;
+    }
+    if (shape[0] == 1 || shape[1] == 1) {
+      return true;
+    }
+    return (strides[0] == strides[1] * shape[1]);
+  };
+
+  auto q = copy_unless(is_contiguous, q_pre);
+
+  // Donate the query if possible
+  if (q.is_donatable() && q.flags().row_contiguous && q.size() == o.size()) {
+    o.copy_shared_buffer(q);
+  } else {
+    o.set_data(allocator::malloc(o.nbytes()));
+  }
+
+  auto k = copy_unless(is_contiguous_except_seq_len, k_pre);
+  auto k_scales = copy_unless(is_contiguous_except_seq_len, k_scales_pre);
+  auto k_biases = copy_unless(is_contiguous_except_seq_len, k_biases_pre);
+  auto v = copy_unless(is_contiguous_except_seq_len, v_pre);
+  auto v_scales = copy_unless(is_contiguous_except_seq_len, v_scales_pre);
+  auto v_biases = copy_unless(is_contiguous_except_seq_len, v_biases_pre);
+
+  quant_sdpa_vector_2pass(
+      s, d, q, k, k_scales, k_biases, v, v_scales, v_biases,
+      o, scale_, group_size_, bits_);
+
+  d.add_temporaries(std::move(copies), s.index);
+}
+
+// ============================================================================
+// LUTScaledDotProductAttention
+// ============================================================================
+
+void LUTScaledDotProductAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& q_pre = inputs[0];
+  auto& k_pre = inputs[1];
+  auto& k_norms_pre = inputs[2];
+  auto& v_pre = inputs[3];
+  auto& v_norms_pre = inputs[4];
+  auto& centroids_k_pre = inputs[5];
+  auto& centroids_v_pre = inputs[6];
+  auto& o = outputs[0];
+
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    } else {
+      return arr;
+    }
+  };
+
+  auto is_contiguous = [](const array& arr) {
+    return arr.flags().row_contiguous;
+  };
+
+  auto is_contiguous_except_seq_len = [](const array& arr) {
+    auto& strides = arr.strides();
+    auto& shape = arr.shape();
+    if (strides.back() != 1) {
+      return false;
+    }
+    if (shape[0] == 1 || shape[1] == 1) {
+      return true;
+    }
+    return (strides[0] == strides[1] * shape[1]);
+  };
+
+  auto q = copy_unless(is_contiguous, q_pre);
+
+  // Donate the query if possible
+  if (q.is_donatable() && q.flags().row_contiguous && q.size() == o.size()) {
+    o.copy_shared_buffer(q);
+  } else {
+    o.set_data(allocator::malloc(o.nbytes()));
+  }
+
+  auto k = copy_unless(is_contiguous_except_seq_len, k_pre);
+  auto k_norms = copy_unless(is_contiguous, k_norms_pre);
+  auto v = copy_unless(is_contiguous_except_seq_len, v_pre);
+  auto v_norms = copy_unless(is_contiguous, v_norms_pre);
+  auto centroids_k = copy_unless(is_contiguous, centroids_k_pre);
+  auto centroids_v = copy_unless(is_contiguous, centroids_v_pre);
+
+  lut_sdpa_vector_2pass(
+      s, d, q, k, k_norms, v, v_norms, centroids_k, centroids_v,
+      o, scale_, sparse_v_threshold_, bits_);
+
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 } // namespace mlx::core::fast

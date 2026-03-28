@@ -54,6 +54,42 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+/** Computes: O = softmax(Q @ K.T) @ V where K and V are affine-quantized. **/
+MLX_API array quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const array& key_biases,
+    const array& values,
+    const array& value_scales,
+    const array& value_biases,
+    const float scale,
+    const int group_size = 64,
+    const int bits = 4,
+    StreamOrDevice s = {});
+
+/** Computes: O = softmax(Q @ K.T) @ V where K and V use centroid LUT quant.
+ *
+ * Instead of affine dequant (value = scale * packed + bias), this uses:
+ *   value = centroids[packed_index] * norm
+ * where centroids is a small LUT and norm is per-position.
+ *
+ * Supports sparse-V optimization: positions with attention weight below
+ * sparse_v_threshold are skipped during V accumulation.
+ **/
+MLX_API array lut_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys_packed,
+    const array& k_norms,
+    const array& values_packed,
+    const array& v_norms,
+    const array& centroids_k,
+    const array& centroids_v,
+    const float scale,
+    const int bits = 4,
+    const float sparse_v_threshold = 0.0f,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
