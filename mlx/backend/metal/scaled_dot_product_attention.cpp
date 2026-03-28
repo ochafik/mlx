@@ -778,11 +778,19 @@ void lut_sdpa_vector_2pass(
   // Launch
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
-  // Final pass (reuse the existing 2pass_2 kernel)
+  // Final pass: LUT pass1 always writes float32 intermediates,
+  // so use the float variant of pass2 regardless of query dtype.
+  // If the output dtype differs from float32, we need a temporary.
+  bool needs_cast = out.dtype() != float32;
+  array pass2_out = out;
+  if (needs_cast) {
+    pass2_out = array(out.shape(), float32, nullptr, {});
+    pass2_out.set_data(allocator::malloc(pass2_out.nbytes()));
+    d.add_temporary(pass2_out, s.index);
+  }
+
   kname.clear();
-  kname += "sdpa_vector_2pass_2_";
-  kname += get_type_string(q.dtype());
-  kname += "_";
+  kname += "sdpa_vector_2pass_2_float_";
   kname += std::to_string(q.shape(-1));
 
   // Get the kernel
@@ -793,13 +801,18 @@ void lut_sdpa_vector_2pass(
   compute_encoder.set_input_array(intermediate, 0);
   compute_encoder.set_input_array(sums, 1);
   compute_encoder.set_input_array(maxs, 2);
-  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_output_array(pass2_out, 3);
   compute_encoder.set_bytes(blocks, 4);
 
   // Launch
   group_dims = MTL::Size(1024, 1, 1);
   grid_dims = MTL::Size(B, 1, 1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // Cast float32 pass2 output to the desired output dtype
+  if (needs_cast) {
+    copy_gpu(pass2_out, out, CopyType::General, s);
+  }
 }
 
 } // namespace

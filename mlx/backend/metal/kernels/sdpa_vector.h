@@ -741,6 +741,12 @@ template <typename T, int D, int bits>
   constexpr int BN = 8;
   constexpr int BD = 4;
   constexpr int elem_per_thread = D / BD;
+  // Tile the head dimension to cap register usage at 32 elements per array.
+  // For D<=128: tile_elems=elem_per_thread (1 tile, no overhead).
+  // For D=256:  tile_elems=32, n_tiles=2 (k/v loaded in 2 chunks).
+  constexpr int MAX_EPT = 32;
+  constexpr int n_tiles = (elem_per_thread + MAX_EPT - 1) / MAX_EPT;
+  constexpr int tile_elems = elem_per_thread / n_tiles;
   const int stride = BN * D;
   constexpr int nblocks = 32;
   constexpr int pack_factor = 32 / bits;
@@ -749,9 +755,10 @@ template <typename T, int D, int bits>
   typedef float U;
 
   thread U q[elem_per_thread];
-  thread U k[elem_per_thread];
-  thread U v[elem_per_thread];
   thread U o[elem_per_thread];
+  // k and v are tiled to reduce register pressure for large D
+  thread U k[tile_elems];
+  thread U v[tile_elems];
 
   threadgroup U outputs[BN * BD];
   threadgroup U max_scores[BN];
@@ -809,17 +816,22 @@ template <typename T, int D, int bits>
 
   // For each key
   for (int i = block_idx * BN + quad_gid; i < N; i += nblocks * BN) {
-    // Read the key via centroid LUT
-    lut_load_keys<U, elem_per_thread, bits>(keys, k, tg_centroids_k);
+    // Compute the i-th score: dot(q, centroid_key) * norm
+    // Tile over D to avoid large k[] register array for D>128
+    U score = 0;
+    for (int t = 0; t < n_tiles; t++) {
+      // Load this tile's portion of the key via centroid LUT
+      // keys pointer is at the start of this position's packed data;
+      // offset by t * tile_elems elements (in packed units)
+      lut_load_keys<U, tile_elems, bits>(
+          keys + t * tile_elems / pack_factor, k, tg_centroids_k);
+      for (int j = 0; j < tile_elems; j++) {
+        score += q[t * tile_elems + j] * k[j];
+      }
+    }
 
     // Get per-position key norm
     U kn = static_cast<U>(k_norms[0]);
-
-    // Compute the i-th score: dot(q, centroid_key) * norm
-    U score = 0;
-    for (int j = 0; j < elem_per_thread; j++) {
-      score += q[j] * k[j];
-    }
     score = quad_sum(score) * kn;
 
     // Update the accumulators
@@ -838,13 +850,14 @@ template <typename T, int D, int bits>
                          (exp_score > sparse_v_threshold * sum_exp_score);
 
     if (do_accumulate) {
-      // Read values via centroid LUT
-      lut_load_values<U, elem_per_thread, bits>(values, v, tg_centroids_v);
       U vn = static_cast<U>(v_norms[0]);
-
-      // Update the output accumulator
-      for (int j = 0; j < elem_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * v[j] * vn;
+      // Read and accumulate values in tiles to reduce register pressure
+      for (int t = 0; t < n_tiles; t++) {
+        lut_load_values<U, tile_elems, bits>(
+            values + t * tile_elems / pack_factor, v, tg_centroids_v);
+        for (int j = 0; j < tile_elems; j++) {
+          o[t * tile_elems + j] = o[t * tile_elems + j] * factor + exp_score * v[j] * vn;
+        }
       }
     } else {
       // Still need to rescale existing output for the new max

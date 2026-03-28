@@ -1209,6 +1209,8 @@ array lut_scaled_dot_product_attention(
   };
 
   int L = queries.shape(2);
+  // TODO: D=256 Metal kernel has quality issues with some GQA configs.
+  // Needs investigation. For now, only D=64/128 use the Metal kernel.
   bool compatible_head_dim = query_head_dim == 64 || query_head_dim == 128;
   if (L > 1 || !compatible_head_dim || stream.device == Device::cpu) {
     return fallback(

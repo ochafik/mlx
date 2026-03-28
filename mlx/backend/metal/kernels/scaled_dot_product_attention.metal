@@ -59,7 +59,8 @@ instantiate_sdpa_vector_heads(float16_t)
 
 #define instantiate_quant_sdpa_vector_heads(type) \
   instantiate_quant_sdpa_vector_group_size(type, 64)  \
-  instantiate_quant_sdpa_vector_group_size(type, 128)
+  instantiate_quant_sdpa_vector_group_size(type, 128) \
+  instantiate_quant_sdpa_vector_group_size(type, 256)
 
 instantiate_quant_sdpa_vector_heads(float)
 instantiate_quant_sdpa_vector_heads(bfloat16_t)
@@ -78,7 +79,8 @@ instantiate_quant_sdpa_vector_heads(float16_t)
 
 #define instantiate_lut_sdpa_vector_heads(type) \
   instantiate_lut_sdpa_vector_bits(type, 64)     \
-  instantiate_lut_sdpa_vector_bits(type, 128)
+  instantiate_lut_sdpa_vector_bits(type, 128)    \
+  instantiate_lut_sdpa_vector_bits(type, 256)
 
 instantiate_lut_sdpa_vector_heads(float)
 instantiate_lut_sdpa_vector_heads(bfloat16_t)
