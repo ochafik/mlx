@@ -730,7 +730,7 @@ void lut_sdpa_vector_2pass(
   size_t k_stride = k.strides()[1];
   size_t v_stride = v.strides()[1];
   int n_centroids = centroids_k.shape(0);
-  MTL::Size group_dims(8 * 4, 1, 1);
+  MTL::Size group_dims(32, 1, 1);
   MTL::Size grid_dims(1, B, blocks);
 
   // Allocate the intermediates

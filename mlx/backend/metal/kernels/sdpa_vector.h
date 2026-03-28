@@ -621,89 +621,6 @@ template <typename T, int D, int group_size, int bits>
 // Centroid LUT SDPA helpers (TurboQuant/PolarQuant style)
 // ============================================================================
 
-// Unpack quantized indices and look up centroids from a LUT.
-// centroids: small array of (1 << bits) entries, stored in threadgroup memory.
-// The unpacked index selects a centroid value.
-template <typename U, int elem_per_thread, int bits>
-METAL_FUNC void lut_load_keys(
-    const device uint32_t* keys,
-    thread U* k,
-    threadgroup const U* centroids) {
-  constexpr uint mask = (1u << bits) - 1u;
-  if (bits == 3) {
-    // 3-bit: 10 values per uint32 (with 2 bits wasted)
-    // We process elem_per_thread elements. Each uint32 has 10 3-bit values.
-    // For simplicity, read as bytes and extract bit-by-bit.
-    // Actually, let's do direct bit extraction from the packed uint32s.
-    const device uint32_t* packed = keys;
-    int bit_offset = 0;
-    int word_idx = 0;
-    for (int i = 0; i < elem_per_thread; i++) {
-      uint word = packed[word_idx];
-      uint idx = (word >> bit_offset) & mask;
-      k[i] = centroids[idx];
-      bit_offset += bits;
-      if (bit_offset + bits > 32) {
-        word_idx++;
-        bit_offset = 0;
-      }
-    }
-  } else if (bits == 4) {
-    // 4-bit: 8 values per uint32
-    auto ks = (const device uint8_t*)keys;
-    for (int i = 0; i < elem_per_thread / 2; i++) {
-      uint idx0 = ks[i] & 0x0f;
-      uint idx1 = (ks[i] >> 4) & 0x0f;
-      k[2 * i] = centroids[idx0];
-      k[2 * i + 1] = centroids[idx1];
-    }
-  } else if (bits == 8) {
-    auto ks = (const device uint8_t*)keys;
-    for (int i = 0; i < elem_per_thread; i++) {
-      uint idx = ks[i];
-      k[i] = centroids[idx];
-    }
-  }
-}
-
-// Same as lut_load_keys but for values
-template <typename U, int elem_per_thread, int bits>
-METAL_FUNC void lut_load_values(
-    const device uint32_t* values,
-    thread U* v,
-    threadgroup const U* centroids) {
-  constexpr uint mask = (1u << bits) - 1u;
-  if (bits == 3) {
-    const device uint32_t* packed = values;
-    int bit_offset = 0;
-    int word_idx = 0;
-    for (int i = 0; i < elem_per_thread; i++) {
-      uint word = packed[word_idx];
-      uint idx = (word >> bit_offset) & mask;
-      v[i] = centroids[idx];
-      bit_offset += bits;
-      if (bit_offset + bits > 32) {
-        word_idx++;
-        bit_offset = 0;
-      }
-    }
-  } else if (bits == 4) {
-    auto vs = (const device uint8_t*)values;
-    for (int i = 0; i < elem_per_thread / 2; i++) {
-      uint idx0 = vs[i] & 0x0f;
-      uint idx1 = (vs[i] >> 4) & 0x0f;
-      v[2 * i] = centroids[idx0];
-      v[2 * i + 1] = centroids[idx1];
-    }
-  } else if (bits == 8) {
-    auto vs = (const device uint8_t*)values;
-    for (int i = 0; i < elem_per_thread; i++) {
-      uint idx = vs[i];
-      v[i] = centroids[idx];
-    }
-  }
-}
-
 // ============================================================================
 // Centroid LUT SDPA kernel (2-pass, pass 1) with sparse-V optimization
 //
@@ -712,7 +629,64 @@ METAL_FUNC void lut_load_values(
 // where centroids is a small LUT (8 or 16 entries) and norm is per-position.
 //
 // Sparse-V: if attention weight < threshold, skip V dequant+accumulate.
+//
+// Structure matches sdpa_vector_2pass_1: 1 simdgroup of 32 threads, each
+// thread handles D/32 elements. Each threadgroup processes one K/V position
+// at a time, striding by nblocks. No tiling needed even for D=256 since
+// elem_per_thread = 8.
+//
+// Byte-level addressing: packed K/V data is accessed via byte pointers to
+// avoid alignment issues when elem_per_thread < pack_factor.
 // ============================================================================
+
+// LUT load with element offset within a position.
+// pos_base: uint32_t pointer to the start of the current position's packed data
+// elem_offset: the first element index this thread should read (must be even for 4-bit)
+// Reads elem_per_thread elements starting at elem_offset.
+template <typename U, int elem_per_thread, int bits>
+METAL_FUNC void lut_load_at(
+    const device uint32_t* pos_base,
+    int elem_offset,
+    thread U* out,
+    threadgroup const U* centroids) {
+  constexpr uint mask = (1u << bits) - 1u;
+  if (bits == 3) {
+    // 3-bit: bit-level extraction from uint32 words
+    int start_bit = elem_offset * 3;
+    for (int i = 0; i < elem_per_thread; i++) {
+      int bit_pos = start_bit + i * 3;
+      int word_idx = bit_pos / 32;
+      int bit_offset = bit_pos % 32;
+      uint word = pos_base[word_idx];
+      uint idx = (word >> bit_offset) & mask;
+      // Handle cross-word boundary
+      if (bit_offset + bits > 32) {
+        uint next_word = pos_base[word_idx + 1];
+        int remaining_bits = 32 - bit_offset;
+        idx = (idx | (next_word << remaining_bits)) & mask;
+      }
+      out[i] = centroids[idx];
+    }
+  } else if (bits == 4) {
+    // 4-bit: 2 elements per byte, elem_offset must be even
+    const device uint8_t* bytes = (const device uint8_t*)pos_base;
+    bytes += elem_offset / 2;
+    for (int i = 0; i < elem_per_thread / 2; i++) {
+      uint idx0 = bytes[i] & 0x0f;
+      uint idx1 = (bytes[i] >> 4) & 0x0f;
+      out[2 * i] = centroids[idx0];
+      out[2 * i + 1] = centroids[idx1];
+    }
+  } else if (bits == 8) {
+    // 8-bit: 1 element per byte
+    const device uint8_t* bytes = (const device uint8_t*)pos_base;
+    bytes += elem_offset;
+    for (int i = 0; i < elem_per_thread; i++) {
+      uint idx = bytes[i];
+      out[i] = centroids[idx];
+    }
+  }
+}
 
 template <typename T, int D, int bits>
 [[kernel]] void lut_sdpa_vector_2pass_1(
@@ -734,51 +708,31 @@ template <typename T, int D, int bits>
     const constant float& sparse_v_threshold,
     const constant int& n_centroids,
     uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]],
-    uint quad_gid [[quadgroup_index_in_threadgroup]],
-    uint quad_lid [[thread_index_in_quadgroup]]) {
-  constexpr int BN = 8;
-  constexpr int BD = 4;
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
   constexpr int elem_per_thread = D / BD;
-  // Tile the head dimension to cap register usage at 32 elements per array.
-  // For D<=128: tile_elems=elem_per_thread (1 tile, no overhead).
-  // For D=256:  tile_elems=32, n_tiles=2 (k/v loaded in 2 chunks).
-  constexpr int MAX_EPT = 32;
-  constexpr int n_tiles = (elem_per_thread + MAX_EPT - 1) / MAX_EPT;
-  constexpr int tile_elems = elem_per_thread / n_tiles;
-  const int stride = BN * D;
   constexpr int nblocks = 32;
   constexpr int pack_factor = 32 / bits;
-  constexpr int max_centroids = (1 << bits);  // 8 for 3-bit, 16 for 4-bit, 256 for 8-bit
+  constexpr int max_centroids = (1 << bits);
+  // Packed uint32s per position
+  constexpr int packed_per_pos = D / pack_factor;
 
   typedef float U;
 
   thread U q[elem_per_thread];
-  thread U o[elem_per_thread];
-  // k and v are tiled to reduce register pressure for large D
-  thread U k[tile_elems];
-  thread U v[tile_elems];
+  thread U k[elem_per_thread];
+  thread U o[elem_per_thread] = {0};
 
-  threadgroup U outputs[BN * BD];
-  threadgroup U max_scores[BN];
-  threadgroup U sum_exp_scores[BN];
   // Centroid LUTs in threadgroup memory for fast access
   threadgroup U tg_centroids_k[max_centroids];
   threadgroup U tg_centroids_v[max_centroids];
 
-  // Load centroids into threadgroup memory
-  // Total threads in threadgroup = BN * BD = 8 * 4 = 32
-  // For 8-bit, max_centroids = 256, so we need multiple iterations
-  {
-    const int tid_in_tg = quad_gid * BD + quad_lid;
-    const int tg_size = BN * BD;
-    for (int c = tid_in_tg; c < max_centroids; c += tg_size) {
-      tg_centroids_k[c] = (c < n_centroids) ?
-          static_cast<U>(centroids_k_in[c]) : U(0);
-      tg_centroids_v[c] = (c < n_centroids) ?
-          static_cast<U>(centroids_v_in[c]) : U(0);
-    }
+  // Load centroids into threadgroup memory (32 threads cooperate)
+  for (int c = simd_lid; c < max_centroids; c += BD) {
+    tg_centroids_k[c] = (c < n_centroids) ?
+        static_cast<U>(centroids_k_in[c]) : U(0);
+    tg_centroids_v[c] = (c < n_centroids) ?
+        static_cast<U>(centroids_v_in[c]) : U(0);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -786,55 +740,53 @@ template <typename T, int D, int bits>
   const int block_idx = tid.z;
   const int head_idx = tid.y;
   const int kv_head_idx = head_idx / gqa_factor;
-  queries += head_idx * D + quad_lid * elem_per_thread;
+  queries += head_idx * D + simd_lid * elem_per_thread;
 
-  const int kv_idx =
-      (block_idx * BN + quad_gid) * D + quad_lid * elem_per_thread;
-  const int packed_idx = kv_idx / pack_factor;
+  // Position-level pointer: always uint32-aligned since each position's
+  // packed data occupies packed_per_pos uint32s.
+  // k_stride is in uint32 units for the head dimension.
+  const device uint32_t* keys_pos =
+      keys + kv_head_idx * k_stride + block_idx * packed_per_pos;
+  const device uint32_t* values_pos =
+      values + kv_head_idx * v_stride + block_idx * packed_per_pos;
 
-  keys += kv_head_idx * k_stride + packed_idx;
-  // k_norms is per-position: shape [B, n_kv_heads, N]
-  // Stride in the head dimension is N
-  k_norms += kv_head_idx * N + block_idx * BN + quad_gid;
-  values += kv_head_idx * v_stride + packed_idx;
-  v_norms += kv_head_idx * N + block_idx * BN + quad_gid;
+  // Per-thread element offset within each position
+  const int elem_offset = simd_lid * elem_per_thread;
 
-  out += head_idx * nblocks * D + block_idx * D + quad_lid * elem_per_thread;
+  // k_norms/v_norms are per-position: shape [B, n_kv_heads, N]
+  k_norms += kv_head_idx * N + block_idx;
+  v_norms += kv_head_idx * N + block_idx;
+
+  out += head_idx * nblocks * D + block_idx * D + simd_lid * elem_per_thread;
   sums += head_idx * nblocks + block_idx;
   maxs += head_idx * nblocks + block_idx;
 
-  // Read the query and 0 the output accumulator
+  // Read the query
   for (int i = 0; i < elem_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
-  }
-  for (int i = 0; i < elem_per_thread; i++) {
-    o[i] = 0;
   }
 
   U max_score = -1e9;
   U sum_exp_score = 0;
 
-  // For each key
-  for (int i = block_idx * BN + quad_gid; i < N; i += nblocks * BN) {
-    // Compute the i-th score: dot(q, centroid_key) * norm
-    // Tile over D to avoid large k[] register array for D>128
+  // Stride for advancing to the next position in packed uint32 units
+  const int pos_advance = nblocks * packed_per_pos;
+
+  // For each key (one position at a time, striding by nblocks)
+  for (int i = block_idx; i < N; i += nblocks) {
+    // Load key via centroid LUT and compute dot product
+    lut_load_at<U, elem_per_thread, bits>(
+        keys_pos, elem_offset, k, tg_centroids_k);
     U score = 0;
-    for (int t = 0; t < n_tiles; t++) {
-      // Load this tile's portion of the key via centroid LUT
-      // keys pointer is at the start of this position's packed data;
-      // offset by t * tile_elems elements (in packed units)
-      lut_load_keys<U, tile_elems, bits>(
-          keys + t * tile_elems / pack_factor, k, tg_centroids_k);
-      for (int j = 0; j < tile_elems; j++) {
-        score += q[t * tile_elems + j] * k[j];
-      }
+    for (int j = 0; j < elem_per_thread; j++) {
+      score += q[j] * k[j];
     }
 
-    // Get per-position key norm
+    // Reduce across all 32 threads and apply per-position norm
     U kn = static_cast<U>(k_norms[0]);
-    score = quad_sum(score) * kn;
+    score = simd_sum(score) * kn;
 
-    // Update the accumulators
+    // Update the accumulators (online softmax)
     U new_max = max(max_score, score);
     U factor = fast::exp(max_score - new_max);
     U exp_score = fast::exp(score - new_max);
@@ -843,21 +795,16 @@ template <typename T, int D, int bits>
     sum_exp_score = sum_exp_score * factor + exp_score;
 
     // Sparse-V optimization: skip V dequant+accumulate if weight is negligible
-    // We approximate the attention weight as exp_score / (sum_exp_score)
-    // but since we're in online softmax, we check the raw exp_score against
-    // threshold * sum_exp_score as a heuristic.
     bool do_accumulate = (sparse_v_threshold <= 0.0f) ||
                          (exp_score > sparse_v_threshold * sum_exp_score);
 
     if (do_accumulate) {
       U vn = static_cast<U>(v_norms[0]);
-      // Read and accumulate values in tiles to reduce register pressure
-      for (int t = 0; t < n_tiles; t++) {
-        lut_load_values<U, tile_elems, bits>(
-            values + t * tile_elems / pack_factor, v, tg_centroids_v);
-        for (int j = 0; j < tile_elems; j++) {
-          o[t * tile_elems + j] = o[t * tile_elems + j] * factor + exp_score * v[j] * vn;
-        }
+      thread U v[elem_per_thread];
+      lut_load_at<U, elem_per_thread, bits>(
+          values_pos, elem_offset, v, tg_centroids_v);
+      for (int j = 0; j < elem_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * v[j] * vn;
       }
     } else {
       // Still need to rescale existing output for the new max
@@ -866,46 +813,22 @@ template <typename T, int D, int bits>
       }
     }
 
-    // Move the pointers to the next kv
-    keys += nblocks * stride / pack_factor;
-    values += nblocks * stride / pack_factor;
-    k_norms += nblocks * BN;
-    v_norms += nblocks * BN;
+    // Move the pointers to the next kv position
+    keys_pos += pos_advance;
+    values_pos += pos_advance;
+    k_norms += nblocks;
+    v_norms += nblocks;
   }
 
-  // Each thread has a partial part of the output so we need to combine them.
-
-  // First let's communicate the max and sum_exp
-  if (quad_lid == 0) {
-    max_scores[quad_gid] = max_score;
-    sum_exp_scores[quad_gid] = sum_exp_score;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  max_score = (simd_lid < BN) ? max_scores[simd_lid] : -1e9;
-  U new_max = simd_max(max_score);
-  U factor = fast::exp(max_score - new_max);
-  sum_exp_score = (simd_lid < BN) ? sum_exp_scores[simd_lid] : 0;
-  sum_exp_score = simd_sum(sum_exp_score * factor);
-
-  // Write the sum and new max
-  if (simd_gid == 0) {
+  // Write the sum and max (only thread 0 needs to write these scalars)
+  if (simd_lid == 0) {
     sums[0] = sum_exp_score;
-    maxs[0] = new_max;
+    maxs[0] = max_score;
   }
 
-  // Now we need to aggregate all the outputs
+  // Each thread writes its portion of the output directly (no reduction needed
+  // since each thread owns distinct output elements, like sdpa_vector_2pass_1)
   for (int i = 0; i < elem_per_thread; i++) {
-    outputs[quad_lid * BN + quad_gid] =
-        o[i] * fast::exp(max_scores[quad_gid] - new_max);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (quad_gid == 0) {
-      U output = outputs[quad_lid * BN];
-      for (int j = 1; j < BN; j++) {
-        output += outputs[quad_lid * BN + j];
-      }
-      out[i] = static_cast<T>(output);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    out[i] = o[i];
   }
 }
