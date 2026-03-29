@@ -1209,6 +1209,12 @@ array lut_scaled_dot_product_attention(
     return std::vector<array>{out};
   };
 
+  // Centroids must be float32 — the kernel reads them as const device float*
+  auto ck = centroids_k.dtype() == float32
+      ? centroids_k : astype(centroids_k, float32, stream);
+  auto cv = centroids_v.dtype() == float32
+      ? centroids_v : astype(centroids_v, float32, stream);
+
   int L = queries.shape(2);
   bool compatible_head_dim =
       query_head_dim == 64 || query_head_dim == 128 || query_head_dim == 256;
@@ -1219,8 +1225,8 @@ array lut_scaled_dot_product_attention(
          k_norms,
          values_packed,
          v_norms,
-         centroids_k,
-         centroids_v})[0];
+         ck,
+         cv})[0];
   } else {
     return array(
         std::move(out_shape),
@@ -1237,8 +1243,8 @@ array lut_scaled_dot_product_attention(
          k_norms,
          values_packed,
          v_norms,
-         centroids_k,
-         centroids_v});
+         ck,
+         cv});
   }
 }
 
